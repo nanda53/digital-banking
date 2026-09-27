@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from jose import jwt, JWTError
+from contextlib import asynccontextmanager
 import uuid
 import redis
 import os
@@ -12,25 +13,47 @@ from . import models, schemas, security, transfer_engine
 from .database import engine, get_db
 from .seed import run_seed
 
-# Create database tables
-models.Base.metadata.create_all(bind=engine)
+# Safe startup sequence via lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Create tables first
+    models.Base.metadata.create_all(bind=engine)
+    # 2. Run initial seeder safely
+    try:
+        run_seed()
+    except Exception as e:
+        print(f"Seed notice: {e}")
+    yield
 
-# Execute the auto-seeder on startup
-run_seed()
+app = FastAPI(title="Core Banking API", lifespan=lifespan)
 
-app = FastAPI(title="Core Banking API")
+# Allow requests from local dev and live Vercel frontend
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://digital-banking-mu.vercel.app",
+]
 
-# Setup CORS for React frontend
+# Support custom frontend URL from env if set
+if os.getenv("FRONTEND_URL"):
+    allowed_origins.append(os.getenv("FRONTEND_URL"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Matches preview deployments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+# Upstash requires TLS/SSL connection handling
+redis_client = redis.Redis.from_url(
+    os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+    decode_responses=True
+)
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
@@ -42,6 +65,10 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+@app.get("/")
+def health_check():
+    return {"status": "healthy", "service": "Nexus Banking API"}
+
 @app.post("/register")
 def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     hashed_pw = security.get_password_hash(user.password)
@@ -50,7 +77,7 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_user)
     
-    acc = models.Account(account_number=f"ACC-{uuid.uuid4().hex[:6]}", user_id=db_user.id, balance=10000.00)
+    acc = models.Account(account_number=f"ACC-{uuid.uuid4().hex[:6].upper()}", user_id=db_user.id, balance=10000.00)
     db.add(acc)
     db.commit()
     return {"message": "User and Account created", "user_id": db_user.id}
